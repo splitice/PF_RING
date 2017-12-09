@@ -758,7 +758,7 @@ static void consume_pending_pkts(struct pf_ring_socket *pfr, u_int8_t synchroniz
 	  /* Reset all */
 	  pfr->tx.last_tx_dev = NULL, pfr->tx.last_tx_dev_idx = UNKNOWN_INTERFACE;
 
-	  pfr->tx.last_tx_dev = __dev_get_by_index(pfr->net, hdr->extended_hdr.tx.bounce_interface);
+	  pfr->tx.last_tx_dev = __dev_get_by_index(sock_net(pfr->sk), hdr->extended_hdr.tx.bounce_interface);
 
 	  if(pfr->tx.last_tx_dev != NULL) {
 	    /* We have found the device */
@@ -907,7 +907,7 @@ static void ring_proc_add(struct pf_ring_socket *pfr)
 
   write_lock(&netns_lock);
 
-  netns = netns_lookup(pfr->net);
+  netns = netns_lookup(sock_net(pfr->sk));
 
   if (netns != NULL && 
       netns->proc_dir != NULL &&
@@ -931,7 +931,7 @@ static void ring_proc_remove(struct pf_ring_socket *pfr)
 
   write_lock(&netns_lock);
 
-  netns = netns_lookup(pfr->net);
+  netns = netns_lookup(sock_net(pfr->sk));
 
   if (netns != NULL &&
       netns->proc_dir != NULL &&
@@ -2975,7 +2975,7 @@ static int handle_sw_filtering_hash_bucket(struct pf_ring_socket *pfr,
         return(-EFAULT);
       }
 
-      rule->rule.internals.reflector_dev = dev_get_by_name(pfr->net, rule->rule.reflector_device_name);
+      rule->rule.internals.reflector_dev = dev_get_by_name(sock_net(pfr->sk), rule->rule.reflector_device_name);
 
       if(rule->rule.internals.reflector_dev == NULL) {
         printk("[PF_RING] Unable to find device %s\n",
@@ -3101,7 +3101,7 @@ static int add_sw_filtering_rule_element(struct pf_ring_socket *pfr, sw_filterin
       return(-EFAULT);
     }
 
-    rule->rule.internals.reflector_dev = dev_get_by_name(pfr->net, rule->rule.reflector_device_name);
+    rule->rule.internals.reflector_dev = dev_get_by_name(sock_net(pfr->sk), rule->rule.reflector_device_name);
 
     if(rule->rule.internals.reflector_dev == NULL) {
       printk("[PF_RING] Unable to find device %s\n", rule->rule.reflector_device_name);
@@ -3563,15 +3563,14 @@ static int add_skb_to_ring(struct sk_buff *skb,
     /* [3] Packet sampling */
     if(pfr->sample_rate > 1) {
       write_lock(&pfr->ring_index_lock);
-      pfr->slots_info->tot_pkts++;
 
       if(pfr->pktToSample <= 1) {
 	pfr->pktToSample = pfr->sample_rate;
       } else {
+        pfr->slots_info->tot_pkts++;
 	pfr->pktToSample--;
 
 	write_unlock(&pfr->ring_index_lock);
-
 	atomic_dec(&pfr->num_ring_users);
 	return(-1);
       }
@@ -3870,27 +3869,32 @@ static int skb_ring_handler(struct sk_buff *skb,
   if(quick_mode) {
     pfr = device_rings[skb->dev->ifindex][channel_id];
 
-    if(pfr && pfr->rehash_rss != NULL) {
-      parse_pkt(skb, real_skb, displ, &hdr, &ip_id);
-      channel_id = pfr->rehash_rss(skb, &hdr) % get_num_rx_queues(skb->dev);
-      pfr = device_rings[skb->dev->ifindex][channel_id];
-    }
-
-    if((pfr != NULL) && is_valid_skb_direction(pfr->direction, recv_packet)) {
-      rc = 1;
-      write_lock(&pfr->ring_index_lock);
-      if(pfr->pktToSample <= 1) {
-        pfr->pktToSample = pfr->sample_rate;
-      } else {
-        pfr->pktToSample--;
-        rc = 0;
+    if (pfr != NULL) {
+      if (pfr->rehash_rss != NULL) {
+        parse_pkt(skb, real_skb, displ, &hdr, &ip_id);
+        channel_id = pfr->rehash_rss(skb, &hdr) % get_num_rx_queues(skb->dev);
+        pfr = device_rings[skb->dev->ifindex][channel_id];
       }
-      write_unlock(&pfr->ring_index_lock);
 
-	  if (rc == 1){
-        room_available |= copy_data_to_ring(real_skb ? skb : NULL, pfr, &hdr,
-                      displ, 0, NULL, 0, real_skb ? &clone_id : NULL);
-	  }
+      if (is_valid_skb_direction(pfr->direction, recv_packet)) {
+        rc = 1;
+        
+        if (pfr->sample_rate > 1) {
+          write_lock(&pfr->ring_index_lock);
+          if (pfr->pktToSample <= 1) {
+            pfr->pktToSample = pfr->sample_rate;
+          } else {
+            pfr->slots_info->tot_pkts++;
+            pfr->pktToSample--;
+            rc = 0;
+          }
+          write_unlock(&pfr->ring_index_lock);
+        }
+
+        if (rc == 1) 
+          room_available |= copy_data_to_ring(real_skb ? skb : NULL, pfr, &hdr,
+					      displ, 0, NULL, 0, real_skb ? &clone_id : NULL);
+      }
     }
   } else {
     is_ip_pkt = parse_pkt(skb, real_skb, displ, &hdr, &ip_id);
@@ -4191,7 +4195,6 @@ static int ring_create(struct net *net, struct socket *sock, int protocol
     goto free_sk;
 
   memset(pfr, 0, sizeof(*pfr));
-  pfr->net = net;
   pfr->sk = sk;
   pfr->ring_shutdown = 0;
   pfr->ring_active = 0;	/* We activate as soon as somebody waits for packets */
@@ -4314,7 +4317,7 @@ add_virtual_filtering_device(struct pf_ring_socket *pfr, virtual_filtering_devic
 
   /* Add /proc entry */
   write_lock(&netns_lock);
-  netns = netns_lookup(pfr->net);
+  netns = netns_lookup(sock_net(pfr->sk));
   if (netns != NULL) {
     elem->info.proc_entry = proc_mkdir(elem->info.device_name, netns->proc_dev_dir);
     proc_create_data(PROC_INFO, 0 /* read-only */,
@@ -4345,7 +4348,7 @@ static int remove_virtual_filtering_device(struct pf_ring_socket *pfr, char *dev
     if(strcmp(filtering_ptr->info.device_name, device_name) == 0) {
       /* Remove /proc entry */
       write_lock(&netns_lock);
-      netns = netns_lookup(pfr->net);
+      netns = netns_lookup(sock_net(pfr->sk));
       if (netns != NULL) {
         remove_proc_entry(PROC_INFO, filtering_ptr->info.proc_entry);
         remove_proc_entry(filtering_ptr->info.device_name, netns->proc_dev_dir);
@@ -6196,7 +6199,7 @@ int setSocketStats(struct pf_ring_socket *pfr)
 
   write_lock(&netns_lock);
 
-  netns = netns_lookup(pfr->net);
+  netns = netns_lookup(sock_net(pfr->sk));
 
   if (netns != NULL) {
     /* 1 - Check if the /proc entry exists otherwise create it */
@@ -7658,14 +7661,21 @@ static struct pfring_hooks ring_hooks = {
 void remove_device_from_proc(pf_ring_net *netns, pf_ring_device *dev_ptr) {
   if(dev_ptr->proc_entry == NULL)
     return;
+
 #ifdef ENABLE_PROC_WRITE_RULE
   if(dev_ptr->device_type != standard_nic_family)
     remove_proc_entry(PROC_RULES, dev_ptr->proc_entry);
 #endif
 
+  printk("[PF_RING] Removing %s/%s from /proc\n", dev_ptr->device_name, PROC_INFO);
   remove_proc_entry(PROC_INFO, dev_ptr->proc_entry);
-  /* Note: we are not using dev_ptr->dev->name below in case it is changed and has not been updated */
-  remove_proc_entry(/*dev_ptr->proc_entry->name*/ dev_ptr->device_name, netns->proc_dev_dir);
+
+  if (netns->proc_dev_dir != NULL) {
+    printk("[PF_RING] Removing %s from /proc\n", dev_ptr->device_name);
+    /* Note: we are not using dev_ptr->dev->name below in case it is changed and has not been updated */
+    remove_proc_entry(dev_ptr->device_name, netns->proc_dev_dir);
+  }
+
   dev_ptr->proc_entry = NULL;
 }
 
@@ -8129,31 +8139,26 @@ static void __exit ring_exit(void)
 
   list_del(&any_device_element.device_list);
   list_for_each_safe(ptr, tmp_ptr, &ring_aware_device_list) {
-    pf_ring_device *dev_ptr;
+    pf_ring_device *dev_ptr = list_entry(ptr, pf_ring_device, device_list);
 
-    dev_ptr = list_entry(ptr, pf_ring_device, device_list);
-    hook = (struct pfring_hooks*)dev_ptr->dev->pfring_ptr;
+    hook = (struct pfring_hooks *) dev_ptr->dev->pfring_ptr;
 
     write_lock(&netns_lock);
 
     netns = netns_lookup(dev_net(dev_ptr->dev));
 
-    if (netns != NULL && dev_ptr->proc_entry) {
-#ifdef ENABLE_PROC_WRITE_RULE
-      /* Remove /proc entry for the selected device */
-      if(dev_ptr->device_type != standard_nic_family)
-        remove_proc_entry(PROC_RULES, dev_ptr->proc_entry);
-#endif
-
-      remove_proc_entry(PROC_INFO, dev_ptr->proc_entry);
-      remove_proc_entry(dev_ptr->dev->name, netns->proc_dev_dir);
-    }
+    if (netns != NULL)
+      remove_device_from_proc(netns, dev_ptr);
 
     write_unlock(&netns_lock);
 
-    if(hook->magic == PF_RING) {
-      debug_printk(2, "Unregister hook for %s\n", dev_ptr->device_name);
-      dev_ptr->dev->pfring_ptr = NULL; /* Unhook PF_RING */
+    if (hook != NULL) {
+      if(hook->magic == PF_RING) {
+        debug_printk(2, "Unregister hook for %s\n", dev_ptr->device_name);
+        dev_ptr->dev->pfring_ptr = NULL; /* Unhook PF_RING */
+      }
+    } else {
+      printk("[PF_RING] PF_RING hook was not set for %s\n", dev_ptr->device_name);
     }
 
     list_del(ptr);
